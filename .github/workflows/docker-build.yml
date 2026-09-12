@@ -9,8 +9,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # ghcr.io requires lowercase repository names.
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 permissions:
   contents: read
@@ -28,6 +26,8 @@ jobs:
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
+    env:
+      IMAGE_LC: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +40,11 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr.io requires all-lowercase image names.
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${IMAGE_LC,,}" >> "$GITHUB_OUTPUT"
 
       # Smoke test on the native arch runner: full stack, test sitekey.
       - name: Smoke test (Turnstile relay, test sitekey)
@@ -84,7 +89,7 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
 
@@ -124,11 +129,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute lowercase image name
+        id: image
+        run: |
+          name="ghcr.io/${{ github.repository }}"
+          echo "name=${name,,}" >> "$GITHUB_OUTPUT"
+
       - name: Compute tags
         id: tags
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -140,15 +151,10 @@ jobs:
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
         run: |
+          image="${{ steps.image.outputs.name }}"
           tags="${{ steps.tags.outputs.tags }}"
-          tag_args=""
-          for t in $tags; do
-            tag_args="$tag_args --tag $IMAGE_NAME:$t"
-          done
-          # tags output is newline-separated full image refs; strip the registry prefix
-          # (metadata-action returns them as image:tag already, so use them verbatim).
-          echo "Tagging: $tags"
+          echo "Tagging $image with: $tags"
           docker buildx imagetools create \
-            $(for t in $tags; do printf -- '--tag %s ' "$t"; done) \
-            $(printf "$IMAGE_NAME@sha256:%s " *)
+            $(for t in $tags; do printf -- '--tag %s:%s ' "$image" "${t#$image:}"; done) \
+            $(printf "$image@sha256:%s " *)
 
