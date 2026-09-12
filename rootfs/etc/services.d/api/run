@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# API service: exposes POST /solve, GET /status, GET /healthz on port 8081.
+
+set -u
+
+exec python3 /opt/turnstile-relay/api_server.py

@@ -1,0 +1,149 @@
+name: docker-build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # ghcr.io requires lowercase repository names.
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Smoke test on the native arch runner: full stack, test sitekey.
+      - name: Smoke test (Turnstile relay, test sitekey)
+        run: |
+          set -eux
+          image="relay-smoke:${{ matrix.arch }}"
+          docker build -t "$image" .
+          docker run -d --rm \
+            --name relay-smoke \
+            --shm-size 2g \
+            -e DISPLAY_WIDTH=1280 -e DISPLAY_HEIGHT=800 \
+            -p 127.0.0.1:18081:8081 \
+            -v "$(pwd)/smoke-data:/config" \
+            "$image"
+          cleanup() { docker logs relay-smoke | tail -80 || true; docker rm -f relay-smoke || true; }
+          trap cleanup EXIT
+
+          # Wait for the API (up to ~2 min; Firefox + mitmproxy cold start).
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18081/healthz && break
+            sleep 2
+          done
+
+          # Cloudflare's official "always passes (invisible)" test sitekey.
+          # The document is replaced by the addon, so example.com is never hit.
+          # Expected token: XXXX.DUMMY.TOKEN.XXXX
+          resp=$(curl -s -X POST http://127.0.0.1:18081/solve \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com/login","sitekey":"1x00000000000000000000BB","timeout":180}')
+          echo "solve response: $resp"
+          echo "$resp" | grep -q '"ok":true' && echo "$resp" | grep -q 'XXXX.DUMMY.TOKEN.XXXX'
+
+      - name: Build and push by digest
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/digest-${{ matrix.arch }}${digest#sha256:}"
+      - name: Upload digest artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/digest-*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifest
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          tags="${{ steps.tags.outputs.tags }}"
+          tag_args=""
+          for t in $tags; do
+            tag_args="$tag_args --tag $IMAGE_NAME:$t"
+          done
+          # tags output is newline-separated full image refs; strip the registry prefix
+          # (metadata-action returns them as image:tag already, so use them verbatim).
+          echo "Tagging: $tags"
+          docker buildx imagetools create \
+            $(for t in $tags; do printf -- '--tag %s ' "$t"; done) \
+            $(printf "$IMAGE_NAME@sha256:%s " *)
+

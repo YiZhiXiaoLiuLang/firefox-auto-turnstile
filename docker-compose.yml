@@ -1,0 +1,20 @@
+services:
+  turnstile-relay:
+    image: firefox-auto-turnstile
+    # build: .
+    container_name: turnstile-relay
+    # Firefox needs more shared memory than the default 64MB.
+    shm_size: "2g"
+    ports:
+      - "8081:8081"   # relay API
+      - "5800:5800"   # noVNC web UI (manual interaction) - restrict access!
+      # - "5900:5900" # raw VNC, uncomment if you prefer a VNC client
+    volumes:
+      - ./data:/config
+    environment:
+      - TZ=UTC
+      - DISPLAY_WIDTH=1280
+      - DISPLAY_HEIGHT=800
+      # Set a password for the noVNC/VNC UI before exposing it anywhere:
+      # - VNC_PASSWORD=changeme
+    restart: unless-stopped

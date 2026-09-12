@@ -1,0 +1,27 @@
+#!/bin/sh
+
+set -e # Exit immediately if a command exits with a non-zero status.
+set -u # Treat unset variables as an error.
+
+# Relay data directories.
+mkdir -p /config/relay
+mkdir -p /config/mitmproxy
+
+# The mitmproxy CA is generated per-container (never baked into the image) so
+# a published image cannot be used to MITM arbitrary deployments.  Generate it
+# now, at first boot, via mitmproxy's Python API.
+if [ ! -f /config/mitmproxy/mitmproxy-ca-cert.pem ]; then
+    echo "generating mitmproxy CA..."
+    python3 - <<'EOF'
+from mitmproxy.certs import CertStore
+CertStore.from_store("/config/mitmproxy", "mitmproxy", 2048)
+EOF
+fi
+
+# Make sure Firefox (running as USER_ID) can read the CA.
+chown -R "${USER_ID}:${GROUP_ID}" /config/mitmproxy
+chmod 644 /config/mitmproxy/mitmproxy-ca-cert.pem
+chmod 600 /config/mitmproxy/mitmproxy-ca-cert.key 2>/dev/null || true
+
+# Task/result files are shared between the api service and mitmproxy.
+chown -R "${USER_ID}:${GROUP_ID}" /config/relay

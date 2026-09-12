@@ -1,0 +1,24 @@
+{
+  "policies": {
+    "Certificates": {
+      "Install": ["/config/mitmproxy/mitmproxy-ca-cert.pem"]
+    },
+    "Proxy": {
+      "Mode": "manual",
+      "Locked": true,
+      "HTTPProxy": "127.0.0.1:8080",
+      "SSLProxy": "127.0.0.1:8080",
+      "UseHTTPProxyForAllProtocols": true,
+      "Passthrough": "challenges.cloudflare.com, <local>"
+    },
+    "Homepage": {
+      "URL": "about:blank",
+      "StartPage": "homepage"
+    },
+    "DisableTelemetry": true,
+    "DisableFirefoxAccounts": true,
+    "DisablePocket": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": ""
+  }
+}

@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# mitmproxy service: intercepts the target site's document request and
+# captures the Turnstile token delivered by the injected page.
+# Listens on loopback only - never exposed outside the container.
+
+set -u
+
+exec mitmdump \
+    --listen-host 127.0.0.1 \
+    --listen-port 8080 \
+    --set confdir=/config/mitmproxy \
+    --set connection_strategy=lazy \
+    --set ssl_insecure=false \
+    --set web_open_browser=false \
+    -s /opt/turnstile-relay/relay_addon.py
