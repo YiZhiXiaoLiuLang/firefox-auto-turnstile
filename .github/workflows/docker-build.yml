@@ -75,7 +75,14 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"url":"https://example.com/login","sitekey":"1x00000000000000000000BB","timeout":180}')
           echo "solve response: $resp"
-          echo "$resp" | grep -q '"ok":true' && echo "$resp" | grep -q 'XXXX.DUMMY.TOKEN.XXXX'
+          echo "$resp" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+assert d["ok"] is True, d
+assert d["token"] == "XXXX.DUMMY.TOKEN.XXXX", d
+assert d["hostname"] == "example.com", d
+print("smoke test passed:", d["hostname"], "in", d["elapsed"], "s")
+'
 
       - name: Build and push by digest
         if: github.event_name != 'pull_request'
