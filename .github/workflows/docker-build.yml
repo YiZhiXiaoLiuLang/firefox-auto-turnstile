@@ -58,10 +58,15 @@ jobs:
           trap cleanup EXIT
 
           # Wait for the API (up to ~2 min; Firefox + mitmproxy cold start).
+          api_up=0
           for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:18081/healthz && break
+            if curl -sf http://127.0.0.1:18081/healthz > /dev/null; then api_up=1; break; fi
             sleep 2
           done
+          if [ "$api_up" != "1" ]; then
+            echo "API did not become healthy in 120s"
+            exit 1
+          fi
 
           # Cloudflare's official "always passes (invisible)" test sitekey.
           # The document is replaced by the addon, so example.com is never hit.
