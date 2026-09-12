@@ -154,7 +154,16 @@ jobs:
           image="${{ steps.image.outputs.name }}"
           tags="${{ steps.tags.outputs.tags }}"
           echo "Tagging $image with: $tags"
-          docker buildx imagetools create \
-            $(for t in $tags; do printf -- '--tag %s:%s ' "$image" "${t#$image:}"; done) \
-            $(printf "$image@sha256:%s " *)
+          sources=""
+          for f in digest-*; do
+            d="${f#digest-}"          # strip 'digest-'
+            d="${d#amd64}"; d="${d#arm64}"
+            sources="$sources $image@sha256:$d"
+          done
+          echo "Merging:$sources"
+          tag_args=""
+          for t in $tags; do
+            tag_args="$tag_args --tag $t"
+          done
+          docker buildx imagetools create $tag_args $sources
 
