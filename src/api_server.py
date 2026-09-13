@@ -50,21 +50,32 @@ _current = None  # dict of the in-flight task, or None
 # Click listener.  Normal button events are delivered to the window under
 # the pointer (Firefox) and are invisible to xinput listeners; only RAW
 # events, broadcast through the root window, are globally observable --
-# and only from slave devices (masters emit none).  So we listen to the
-# slave pointers that can produce clicks:
-#   - "TigerVNC pointer":  a human clicking through the noVNC web UI
-#   - "Virtual core XTEST pointer": injected clicks (xdotool, tests)
-# Raw events carry no usable screen position (XTEST valuators are
-# relative), so on every RawButtonPress we query the pointer position
-# via XQueryPointer (xdotool getmouselocation), which is authoritative
-# for both human and XTEST clicks.
+# and only from slave devices (masters emit none).  So we listen to every
+# slave pointer device (e.g. "TigerVNC pointer" for a human clicking
+# through the noVNC web UI, "Virtual core XTEST pointer" for injected
+# xdotool clicks).  Raw events carry no usable screen position (XTEST
+# valuators are relative), so on every RawButtonPress we query the
+# pointer position via XQueryPointer (xdotool getmouselocation), which
+# is authoritative for both human and XTEST clicks.
 # --------------------------------------------------------------------------
 
 _click_lock = threading.Lock()
 _last_click = None  # {"x": int, "y": int, "ts": float}
 _click_during_task = None  # click captured while a task is running
 
-POINTER_DEVICES = ("TigerVNC pointer", "Virtual core XTEST pointer")
+
+def _slave_pointer_devices():
+    """Names of slave pointer devices -- the only ones with raw events."""
+    try:
+        r = subprocess.run(["xinput", "list"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    names = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        m = re.match(r"^(.+?)\s+id=\d+\s+\[slave\s+pointer", line)
+        if m:
+            names.append(m.group(1).strip())
+    return names
 
 
 def _pointer_position():
@@ -94,6 +105,10 @@ def _record_click():
     if pos is None:
         return
     click = {"x": pos[0], "y": pos[1], "ts": time.time()}
+    print("[api] click recorded: x=%d y=%d%s"
+          % (click["x"], click["y"],
+             " (during task)" if _current is not None else ""),
+          flush=True)
     with _click_lock:
         _last_click = click
         if _current is not None:
@@ -131,7 +146,12 @@ def _device_listener(device):
 
 def _click_monitor():
     """Start one listener per slave pointer device."""
-    for device in POINTER_DEVICES:
+    devices = _slave_pointer_devices()
+    if not devices:
+        print("[api] no slave pointer devices found, click calibration "
+              "disabled", flush=True)
+        return
+    for device in devices:
         print("[api] click listener starting for %r" % device, flush=True)
         threading.Thread(target=_device_listener, args=(device,),
                          daemon=True).start()
@@ -350,11 +370,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send(200, {"ok": True})
         elif path == "/status":
-            with _lock:
-                cur = dict(_current) if _current else None
-            last = _read_json(RESULT_FILE)
+            # Read state without acquiring the solve lock: a running task
+            # holds that lock for minutes, and /status is the progress
+            # check for the very task that holds it.
             with _click_lock:
+                cur = dict(_current) if _current else None
                 lc = dict(_last_click) if _last_click else None
+            last = _read_json(RESULT_FILE)
             self._send(200, {"ok": True, "current": cur, "last_result": last,
                              "calibrated_click": lc,
                              "coords": _load_coords()})
