@@ -9,6 +9,12 @@ Single-task model: the container drives one Firefox window, so only one
 solve may be in flight at a time; concurrent requests get 409.  The task is
 communicated to mitmproxy via /config/relay/task.json, and the token comes
 back via /config/relay/result.json (written by the mitmproxy addon).
+
+Click-position calibration: a persistent xinput listener records the last
+mouse click seen on the X display.  During a task, the first click's
+coordinates are captured as the Turnstile checkbox position (the user
+teaches it by clicking once), saved per-hostname in coords.json, and
+returned with the token so future runs can automate the click.
 """
 
 import json
@@ -24,6 +30,8 @@ from urllib.parse import urlsplit
 TASK_DIR = "/config/relay"
 TASK_FILE = os.path.join(TASK_DIR, "task.json")
 RESULT_FILE = os.path.join(TASK_DIR, "result.json")
+COORDS_FILE = os.path.join(TASK_DIR, "coords.json")
+CLICK_FILE = os.path.join(TASK_DIR, "last-click.json")
 NAV_SCRIPT = "/opt/turnstile-relay/nav.sh"
 
 HOST, PORT = "0.0.0.0", 8081
@@ -34,6 +42,86 @@ NAV_MAX_WAIT = 60  # seconds to wait for a usable Firefox window
 
 _lock = threading.Lock()
 _current = None  # dict of the in-flight task, or None
+
+
+# --------------------------------------------------------------------------
+# Click listener: `xinput test-xi2 --root` streams all X input events.  A
+# normal ButtonPress carries the root (screen) coordinates; raw events
+# don't and are skipped.  Output is line-buffered by xinput itself.
+# --------------------------------------------------------------------------
+
+_ev_type = None
+_click_lock = threading.Lock()
+_last_click = None  # {"x": int, "y": int, "ts": float}
+_click_during_task = None  # click captured while a task is running
+
+
+def _click_monitor():
+    """Continuously track the most recent click on the X display."""
+    global _ev_type, _last_click
+    cmd = ["xinput", "test-xi2", "--root"]
+    while True:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1,
+            )
+        except OSError:
+            time.sleep(5)
+            continue
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("EVENT type"):
+                # Exact match: RawButtonPress is a *different* event (no
+                # root coords) and must not be confused with ButtonPress.
+                _ev_type = ("ButtonPress" in line and "Raw" not in line)
+            elif _ev_type and line.startswith("    root:"):
+                m = re.match(r"\s*root:\s*([0-9.]+)/([0-9.]+)", line)
+                if m:
+                    click = {
+                        "x": int(float(m.group(1))),
+                        "y": int(float(m.group(2))),
+                        "ts": time.time(),
+                    }
+                    with _click_lock:
+                        _last_click = click
+                        if _current is not None:
+                            _click_during_task = dict(click)
+                    # Also mirror to a file so mitmproxy (separate process) can
+                    # report the live click position on the injected page.
+                    try:
+                        _atomic_write_json(CLICK_FILE, click)
+                    except OSError:
+                        pass
+        proc.wait()
+        time.sleep(2)  # respawn on unexpected exit
+
+
+def _get_click_during_task():
+    with _click_lock:
+        return dict(_click_during_task) if _click_during_task else None
+
+
+def _clear_click_during_task():
+    global _click_during_task
+    with _click_lock:
+        _click_during_task = None
+
+
+def _load_coords():
+    return _read_json(COORDS_FILE) or {}
+
+
+def _save_coord(hostname, click, sitekey):
+    """Persist the calibrated checkbox position for a hostname."""
+    coords = _load_coords()
+    coords[hostname] = {
+        "x": click["x"], "y": click["y"],
+        "sitekey": sitekey,
+        "display": os.environ.get("DISPLAY_WIDTH", ""),  # resolution context
+        "ts": int(time.time()),
+    }
+    _atomic_write_json(COORDS_FILE, coords)
 
 
 def _atomic_write_json(path, obj):
@@ -150,6 +238,8 @@ class Handler(BaseHTTPRequestHandler):
         """Run one task to completion.  Caller holds _lock."""
         global _current
         _current = task
+        _clear_click_during_task()
+        coord = _load_coords().get(task["hostname"])
         started = time.time()
         try:
             # Clear any stale result, then publish the task for mitmproxy.
@@ -169,13 +259,21 @@ class Handler(BaseHTTPRequestHandler):
                 return 503, {"ok": False, "error": "xdotool navigation failed"}
 
             deadline = time.time() + task["timeout"]
+            click = None
             while time.time() < deadline:
                 result = _read_json(RESULT_FILE)
                 if result and result.get("task_id") == task["task_id"]:
                     elapsed = round(time.time() - started, 2)
+                    # The click that completed the challenge is the calibration
+                    # sample: persist it for this hostname.
+                    click = _get_click_during_task()
+                    if click:
+                        _save_coord(task["hostname"], click, task["sitekey"])
                     return 200, {"ok": True, "task_id": task["task_id"],
                                  "hostname": task["hostname"],
-                                 "token": result["token"], "elapsed": elapsed}
+                                 "token": result["token"], "elapsed": elapsed,
+                                 "click": click,
+                                 "calibrated": bool(click)}
                 time.sleep(POLL_INTERVAL)
             return 504, {"ok": False, "task_id": task["task_id"],
                          "error": "timed out waiting for token"}
@@ -215,13 +313,20 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 cur = dict(_current) if _current else None
             last = _read_json(RESULT_FILE)
-            self._send(200, {"ok": True, "current": cur, "last_result": last})
+            with _click_lock:
+                lc = dict(_last_click) if _last_click else None
+            self._send(200, {"ok": True, "current": cur, "last_result": last,
+                             "calibrated_click": lc,
+                             "coords": _load_coords()})
+        elif path == "/coords":
+            self._send(200, {"ok": True, "coords": _load_coords()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
 
 def main():
     os.makedirs(TASK_DIR, exist_ok=True)
+    threading.Thread(target=_click_monitor, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print("[api] listening on %s:%d" % (HOST, PORT), flush=True)
     srv.serve_forever()

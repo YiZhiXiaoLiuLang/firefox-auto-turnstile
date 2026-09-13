@@ -66,6 +66,21 @@ inp.form.submit();  // 或触发站点自身的提交逻辑
 
 需要人工点击时，用浏览器打开 `http://<host>:5800`（noVNC）操作验证组件。
 
+## 点击校准（复选框位置记忆）
+
+第一次对某个站点过验证时，你在 noVNC 里点击复选框的那一下会被系统**记录为该站点的复选框坐标**：
+
+- 容器内的 `xinput` 监听器捕获点击的屏幕坐标（X server 层面，跨域 iframe 不影响）；
+- Token 返回后，注入页会显示 `Click position recorded: x=…, y=…`，API 响应里也带 `click: {x, y}` 与 `calibrated: true`；
+- 坐标按 hostname 持久化到 `/config/relay/coords.json`，之后可查询：
+
+```bash
+curl http://127.0.0.1:8081/coords
+# {"ok": true, "coords": {"target.example": {"x": 640, "y": 312, ...}}}
+```
+
+这些坐标是为后续自动点击（`xdotool mousemove x y click`）准备的示教数据。注意坐标与分辨率绑定——改 `DISPLAY_WIDTH/HEIGHT` 后需重新校准。
+
 ### 参数
 
 | 字段 | 说明 |
@@ -122,7 +137,7 @@ CI（`.github/workflows/docker-build.yml`）在每次构建时在 arm64 runner �
 
 ## 局限与路线
 
-- v1 单任务串行；需要人工点击（noVNC）。自动点击、并发队列、pre-clearance 模式在 TODO。
+- v1 单任务串行；首次过验证需人工点击（noVNC），点击坐标已被记录校准——自动点击（用记录的坐标 `xdotool click`）、并发队列、pre-clearance 模式在 TODO。
 - 部署 IP 的信誉影响 Turnstile 难度；本方案已保证 Turnstile 流量直连（不走 MITM、指纹干净），但仍建议部署在干净网络。
 - 返回 `token` 后请尽快提交（5 分钟/单次）。
 

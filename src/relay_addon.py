@@ -20,6 +20,7 @@ from mitmproxy import http
 
 TASK_FILE = "/config/relay/task.json"
 RESULT_FILE = "/config/relay/result.json"
+CLICK_FILE = "/config/relay/last-click.json"
 
 # A Turnstile token is valid for 300s.  Tasks older than this are stale.
 TASK_TTL = 360
@@ -47,6 +48,7 @@ PAGE = """<!DOCTYPE html>
 <h1>Turnstile Relay</h1>
 <div id="c"></div>
 <div id="status">Waiting for widget&hellip;</div>
+<div id="clickpos" style="font-size: 15px; color: #666; min-height: 20px;"></div>
 <script>
   function setStatus(msg, cls) {{
     var el = document.getElementById('status');
@@ -65,9 +67,16 @@ PAGE = """<!DOCTYPE html>
       callback: function (token) {{
         setStatus('Token obtained, delivering\u2026');
         fetch('/.relay-token/?t=' + encodeURIComponent(token))
-          .then(function (r) {{
-            if (r.ok) {{ setStatus('\\u2713 Token captured - you can submit it now', 'ok'); }}
-            else {{ setStatus('Delivery failed (HTTP ' + r.status + ')', 'err'); }}
+          .then(function (r) {{ return r.json().catch(function () {{ return {{}}; }}); }})
+          .then(function (d) {{
+            if (d.ok && d.click && typeof d.click.x === 'number') {{
+              var el = document.getElementById('clickpos');
+              el.textContent = 'Click position recorded: x=' + d.click.x + ', y=' + d.click.y;
+              el.className = 'ok';
+              setStatus('\\u2713 Calibration recorded \\u2014 token captured, ready to submit', 'ok');
+            }} else {{
+              setStatus('\\u2713 Token captured - you can submit it now', 'ok');
+            }}
           }})
           .catch(function (e) {{ setStatus('Delivery error: ' + e, 'err'); }});
       }},
@@ -90,6 +99,18 @@ PAGE = """<!DOCTYPE html>
 """
 
 _token_cache = None  # reserved for future use
+
+
+def _read_click():
+    """Latest click recorded by the API service (see api_server.py), if any."""
+    try:
+        with open(CLICK_FILE, "r", encoding="utf-8") as f:
+            click = json.load(f)
+        if isinstance(click.get("x"), int) and isinstance(click.get("y"), int):
+            return click
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _load_task():
@@ -142,8 +163,12 @@ def request(flow: http.HTTPFlow) -> None:
         token = flow.request.query.get("t")
         if token:
             _write_result(task, token)
+            # Report back the click recorded during this task (if any) so the
+            # page can show the captured checkbox coordinates to the user.
+            coord = _read_click()
+            body = json.dumps({"ok": True, "click": coord}).encode("utf-8")
             flow.response = http.Response.make(
-                200, b"ok", {"Content-Type": "text/plain; charset=utf-8"}
+                200, body, {"Content-Type": "application/json; charset=utf-8"}
             )
         else:
             flow.response = http.Response.make(400, b"missing token", {})

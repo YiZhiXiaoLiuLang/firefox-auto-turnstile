@@ -76,11 +76,35 @@ jobs:
           # Cloudflare's official "always passes (invisible)" test sitekey.
           # The document is replaced by the addon, so example.com is never hit.
           # Expected token: XXXX.DUMMY.TOKEN.XXXX
-          resp=$(curl -s -X POST http://127.0.0.1:18081/solve \
+          # Run in the background; while the task is in flight, simulate the
+          # user's calibration click on the widget and assert the coordinates
+          # are captured and returned with the token.
+          curl -s -X POST http://127.0.0.1:18081/solve \
             -H 'Content-Type: application/json' \
-            -d '{"url":"https://example.com/login","sitekey":"1x00000000000000000000BB","timeout":180}')
+            -d '{"url":"https://example.com/login","sitekey":"1x00000000000000000000BB","timeout":180}' \
+            > solve-resp.json &
+          solve_pid=$!
+
+          # Wait until the task is visible in /status (Firefox navigated).
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:18081/status | grep -q '"current"'; then
+              if curl -s http://127.0.0.1:18081/status | python3 -c 'import sys,json; d=json.load(sys.stdin); exit(0 if d["current"] else 1)'; then break; fi
+            fi
+            sleep 1
+          done
+          sleep 2  # let the widget render
+
+          # Simulate the user's click at a known position (inside the widget
+          # area of the injected page). xdotool clicks via the XTEST device;
+          # xinput reports it with root coordinates like a real click.
+          docker exec relay-smoke xdotool mousemove 640 300 click 1
+
+          wait "$solve_pid"
+          resp=$(cat solve-resp.json)
           echo "solve response: $resp"
-          echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is True and d["token"]=="XXXX.DUMMY.TOKEN.XXXX" and d["hostname"]=="example.com", d; print("smoke test passed in", d["elapsed"], "s")'
+          echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is True and d["token"]=="XXXX.DUMMY.TOKEN.XXXX" and d["hostname"]=="example.com" and d.get("calibrated") is True and d["click"]["x"]==640 and d["click"]["y"]==300, d; print("smoke test passed: token + calibration click", d["click"], "in", d["elapsed"], "s")'
+          # The calibration must also be persisted per-hostname.
+          curl -s http://127.0.0.1:18081/coords | python3 -c 'import sys,json; d=json.load(sys.stdin); c=d["coords"]["example.com"]; assert c["x"]==640 and c["y"]==300, d; print("coords persisted:", c)'
 
       - name: Build and push by digest
         if: github.event_name != 'pull_request'

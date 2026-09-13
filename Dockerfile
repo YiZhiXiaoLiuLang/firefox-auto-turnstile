@@ -12,7 +12,9 @@ FROM ${FIREFOX_IMAGE}
 
 # mitmproxy: intercepts target-site documents and captures the token.
 # The Alpine community repo ships a current mitmproxy, so no pip needed.
-RUN add-pkg mitmproxy
+# xinput: streams X input events so the API can record click coordinates
+# (used to teach/remember the Turnstile checkbox position).
+RUN add-pkg mitmproxy xinput
 
 COPY src/relay_addon.py \
      src/api_server.py \
