@@ -97,7 +97,11 @@ jobs:
           # Simulate the user's click at a known position (inside the widget
           # area of the injected page). xdotool clicks via the XTEST device;
           # xinput reports it with root coordinates like a real click.
-          docker exec relay-smoke xdotool mousemove 640 300 click 1
+          # docker exec does not inherit the services' environment; derive
+          # DISPLAY from the live X socket (e.g. /tmp/.X11-unix/X0 -> :0).
+          disp=$(docker exec relay-smoke sh -c 'ls /tmp/.X11-unix/ 2>/dev/null | sed -n "s/^X/:/p" | head -1')
+          echo "X display for exec: $disp"
+          docker exec -e DISPLAY="$disp" relay-smoke xdotool mousemove 640 300 click 1
 
           wait "$solve_pid"
           resp=$(cat solve-resp.json)
