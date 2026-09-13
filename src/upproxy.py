@@ -269,17 +269,28 @@ def _parse_target(buf):
     return target, 443, m.group(0)
 
 
-def _read_request_line(request):
-    """Buffer until the end of the first request (headers done), or None."""
+def _read_request_line(request, want_headers=False):
+    """Buffer the client's request head.
+
+    CONNECT never carries a body, and clients (Firefox, mitmproxy) send
+    the request line alone and WAIT for the 200 before anything else --
+    so by default we return as soon as the first line is complete.  Only
+    require the full blank-line-terminated head when want_headers (for
+    non-CONNECT requests we would need to see all headers; we don't
+    serve those).
+    """
     buf = b""
-    while b"\r\n\r\n" not in buf:
+    while True:
+        if not want_headers and b"\r\n" in buf:
+            return buf
+        if want_headers and b"\r\n\r\n" in buf:
+            return buf
         chunk = request.recv(8192)
         if not chunk:
-            return None
+            return buf if buf else None
         buf += chunk
         if len(buf) > 16384:
             return None
-    return buf
 
 
 def _serve_tunnel(request, upstream_sock):
