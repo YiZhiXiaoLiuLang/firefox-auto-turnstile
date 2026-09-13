@@ -85,20 +85,16 @@ jobs:
             > solve-resp.json &
           solve_pid=$!
 
-          # Wait until mitmproxy has served the injected challenge page --
-          # NOT merely until the task starts: clicking during xdotool's URL
-          # typing would focus the page body mid-navigation and break it.
+          # Click as soon as the page is truly interactive -- the invisible
+          # test sitekey emits its token ~3s after page load, so every sleep
+          # between the signal and the click risks losing the race (the amd64
+          # run lost it by 0.4s).  The page-served marker (document served,
+          # navigation finished) is the earliest safe point: during xdotool's
+          # URL typing the click would break navigation.
           for i in $(seq 1 60); do
             if curl -s http://127.0.0.1:18081/status | python3 -c 'import sys,json; d=json.load(sys.stdin); exit(0 if d["current"] and d["page_served"] else 1)'; then break; fi
             sleep 1
           done
-          sleep 1  # let the widget begin rendering
-
-          # Simulate the user's CALIBRATION click at a known position on the
-          # injected page.  xdotool clicks via the XTEST slave device; the
-          # api's per-device raw-event listener sees it like a real click.
-          # docker exec does not inherit the services' environment; derive
-          # DISPLAY from the live X socket (e.g. /tmp/.X11-unix/X0 -> :0).
           disp=$(docker exec relay-smoke sh -c 'ls /tmp/.X11-unix/ 2>/dev/null | sed -n "s/^X/:/p" | head -1')
           echo "X display for exec: $disp"
           docker exec -e DISPLAY="$disp" relay-smoke xdotool mousemove 640 300 click 1
