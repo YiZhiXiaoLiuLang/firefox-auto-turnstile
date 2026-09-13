@@ -6,10 +6,10 @@
     "Proxy": {
       "Mode": "manual",
       "Locked": true,
-      "HTTPProxy": "127.0.0.1:8080",
-      "SSLProxy": "127.0.0.1:8080",
+      "HTTPProxy": "127.0.0.1:4114",
+      "SSLProxy": "127.0.0.1:4114",
       "UseHTTPProxyForAllProtocols": true,
-      "Passthrough": "challenges.cloudflare.com, <local>"
+      "Passthrough": "<local>"
     },
     "Homepage": {
       "URL": "about:blank",

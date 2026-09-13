@@ -18,6 +18,7 @@ RUN add-pkg mitmproxy xinput
 
 COPY src/relay_addon.py \
      src/api_server.py \
+     src/upproxy.py \
      src/nav.sh \
      /opt/turnstile-relay/
 
@@ -25,6 +26,7 @@ COPY rootfs/ /
 
 RUN chmod +x /etc/services.d/mitm/run \
              /etc/services.d/api/run \
+             /etc/services.d/upproxy/run \
              /etc/cont-init.d/99-relay-init \
              /opt/turnstile-relay/nav.sh
 

@@ -6,4 +6,5 @@
 Dockerfile text eol=lf
 *.dep text eol=lf
 99-relay-init text eol=lf
+run text eol=lf
 *.md text eol=lf

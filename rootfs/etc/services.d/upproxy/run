@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# upproxy service: the egress router.  Firefox's locked proxy points here
+# (port 4114): challenges.cloudflare.com tunnels go to the engine
+# (8082) for clean end-to-end TLS with the task's exit IP; everything
+# else goes to mitmproxy (8080).  mitmproxy itself also uses the engine
+# as its upstream, so with a task proxy set, ALL egress leaves via it.
+
+set -u
+
+exec python3 /opt/turnstile-relay/upproxy.py

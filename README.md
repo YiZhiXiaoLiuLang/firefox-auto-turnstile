@@ -105,10 +105,35 @@ curl http://127.0.0.1:8081/coords
 
 | HTTP | 场景 |
 |---|---|
-| 400 | 参数缺失/格式错误（url 必须是 https、sitekey 格式非法、timeout 越界） |
+| 400 | 参数缺失/格式错误（url 必须是 https、sitekey 格式非法、timeout 越界、proxy URL 非法） |
 | 409 | 已有任务进行中（单任务模型） |
+| 502 | 任务带 proxy 但代理不可达/TLS 握手失败 |
 | 503 | xdotool 无法驱动 Firefox（窗口未就绪） |
 | 504 | 超时未取到 Token |
+
+## 出站代理（proxy 字段）
+
+`POST /solve` 可选 `proxy` 字段，任务期间**所有出站请求**（目标站点文档请求 + challenges.cloudflare.com 挑战流量）都经该代理出去，出口 IP 即代理 IP：
+
+```json
+{"url": "https://example.com/login", "sitekey": "0x4AAA…",
+ "proxy": "socks5://user:pass@1.2.3.4:1080"}
+```
+
+支持的形式（scheme 省略时默认 http）：
+
+| 形式 | 说明 |
+|---|---|
+| `host:port` / `http://[user:pass@]host:port` | HTTP 代理（CONNECT 隧道，支持 Basic 认证） |
+| `https://[user:pass@]host:port` | TLS 上的 HTTP 代理 |
+| `socks4://host:port` | SOCKS4（仅 IP 目标，不支持域名） |
+| `socks5://[user:pass@]host:port` | SOCKS5（RFC 1929 用户名密码认证） |
+
+要点：
+
+- **任务级生效**：代理在任务开始前做可达性探测（不通立即 502，不浪费 timeout）；任务结束自动恢复直连。不带 `proxy` 字段的任务行为与从前完全一致。
+- **挑战流量仍是端到端 TLS**：链路为 `Firefox → 容器内 upproxy 引擎(127.0.0.1:8082) → 你的代理 → challenges.cloudflare.com`，引擎只转发隧道字节，Firefox 的 TLS 指纹直抵 Cloudflare——变的只有出口 IP。mitmproxy 同样以 upstream 模式指向该引擎，目标站文档请求也经代理出去。
+- **socks4 无法代理域名目标**（协议限制，用 socks5）；代理 URL 里的密码含特殊字符时请自行 URL 编码。
 
 ## 配置
 
@@ -118,7 +143,7 @@ curl http://127.0.0.1:8081/coords
 | `DISPLAY_WIDTH/HEIGHT` | 1920×1080 | 分辨率，建议 1280×800 起步 |
 | `TZ` | UTC | 时区 |
 
-mitmproxy 的 CA 证书在容器**首次启动时生成**到 `/config/mitmproxy/`（持久卷），不打进镜像——公开镜像的任何人都不应能 MITM 你的部署。策略文件通过 Firefox 企业策略（`policies.json`）注入信任与代理配置，代理仅监听容器内 `127.0.0.1:8080`。
+mitmproxy 的 CA 证书在容器**首次启动时生成**到 `/config/mitmproxy/`（持久卷），不打进镜像——公开镜像的任何人都不应能 MITM 你的部署。策略文件通过 Firefox 企业策略（`policies.json`）注入信任与代理配置，Firefox 锁定指向容器内的出站路由器（`127.0.0.1:4114`，upproxy 服务：挑战流量→引擎、其余→mitmproxy `127.0.0.1:8080`，均不出容器）。
 
 ## 测试
 

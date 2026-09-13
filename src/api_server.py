@@ -375,6 +375,91 @@ def _navigate(url):
                    capture_output=True, timeout=10)
 
 
+def _validate_proxy(url):
+    """Return an error string for an invalid proxy URL, else None.
+
+    Accepted: scheme://[user:pass@]host:port with scheme in
+    http/https/socks4/socks5 (scheme optional, defaults to http).
+    Mirrors upproxy._parse_upstream, which performs the same parse at
+    egress time -- keep the rules in sync.
+    """
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        scheme = scheme.lower()
+        if scheme not in ("http", "https", "socks4", "socks5"):
+            return ("'proxy' scheme must be http, https, socks4 or socks5 "
+                    "(got %r)" % scheme[:32])
+    else:
+        rest = url
+    if not rest:
+        return "'proxy' URL is empty after the scheme"
+    at = rest.rfind("@")
+    if at != -1:
+        userinfo, hostport = rest[:at], rest[at + 1:]
+        if ":" not in userinfo or not userinfo.split(":", 1)[0]:
+            return "'proxy' userinfo must look like user:pass"
+    else:
+        hostport = rest
+    m = re.fullmatch(r"([0-9a-zA-Z.\-]+|\[[0-9a-fA-F:]+\])(?::(\d+))?",
+                     hostport)
+    if not m:
+        return "'proxy' host:port part is malformed"
+    return None
+
+
+def _check_proxy_reachable(url):
+    """Quick liveness probe of the upstream proxy; error string or None."""
+    import socket
+    import ssl
+    try:
+        scheme, host, port = _proxy_endpoint(url)
+    except ValueError as e:
+        return "invalid proxy: %s" % e
+    try:
+        sock = socket.create_connection((host, port), timeout=8)
+    except OSError as e:
+        return "proxy %s:%d unreachable (%s)" % (host, port, e)
+    try:
+        if scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.wrap_socket(sock, server_hostname=host).close()
+        else:
+            sock.close()
+    except OSError as e:
+        return "proxy %s:%d TLS handshake failed (%s)" % (host, port, e)
+    return None
+
+
+def _proxy_endpoint(url):
+    """(scheme, host, port) of a proxy URL; raises ValueError if malformed."""
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        scheme = scheme.lower()
+    else:
+        scheme, rest = "http", url
+    if scheme not in ("http", "https", "socks4", "socks5"):
+        raise ValueError("unsupported scheme %r" % scheme)
+    at = rest.rfind("@")
+    hostport = rest[at + 1:] if at != -1 else rest
+    if hostport.startswith("["):  # IPv6 literal
+        end = hostport.find("]")
+        if end == -1:
+            raise ValueError("unterminated IPv6 literal")
+        host = hostport[1:end]
+        rest2 = hostport[end + 1:]
+        port = int(rest2[1:]) if rest2.startswith(":") else _proxy_default_port(scheme)
+    else:
+        host, _, ps = hostport.partition(":")
+        if not host:
+            raise ValueError("empty host")
+        port = int(ps) if ps else _proxy_default_port(scheme)
+    return scheme, host, port
+
+
+def _proxy_default_port(scheme):
+    return {"http": 8080, "https": 443, "socks4": 1080, "socks5": 1080}[scheme]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "turnstile-relay/1.0"
 
@@ -427,6 +512,14 @@ class Handler(BaseHTTPRequestHandler):
             return None, (400, {"ok": False, "error": "'url' has no hostname"})
         if not re.fullmatch(r"[0-9a-zA-Z.\-]+", sitekey):
             return None, (400, {"ok": False, "error": "invalid sitekey format"})
+        proxy = payload.get("proxy")
+        if proxy is not None:
+            if not isinstance(proxy, str) or not proxy:
+                return None, (400, {"ok": False,
+                                    "error": "'proxy' must be a non-empty string or null"})
+            err = _validate_proxy(proxy)
+            if err:
+                return None, (400, {"ok": False, "error": err})
         task = {
             "task_id": uuid.uuid4().hex[:12],
             "url": url,
@@ -436,6 +529,8 @@ class Handler(BaseHTTPRequestHandler):
             "timeout": timeout,
             "created": time.time(),
         }
+        if proxy:
+            task["proxy"] = proxy
         return task, None
 
     def _solve(self, task):
@@ -454,6 +549,16 @@ class Handler(BaseHTTPRequestHandler):
                   flush=True)
         started = time.time()
         try:
+            # With a task proxy, fail fast if it cannot be reached at all
+            # (checked before anything runs: an unreachable proxy would
+            # otherwise burn the whole timeout in navigation failures).
+            if task.get("proxy"):
+                err = _check_proxy_reachable(task["proxy"])
+                if err:
+                    return 502, {"ok": False, "task_id": task["task_id"],
+                                 "error": err}
+                print("[api] task egress via proxy: %s" % task["proxy"],
+                      flush=True)
             # Clear any stale result, then publish the task for mitmproxy.
             for f in (RESULT_FILE, TASK_FILE, PAGE_FILE, READY_FILE):
                 try:

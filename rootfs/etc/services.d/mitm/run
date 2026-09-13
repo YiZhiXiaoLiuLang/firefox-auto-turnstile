@@ -3,12 +3,18 @@
 # mitmproxy service: intercepts the target site's document request and
 # captures the Turnstile token delivered by the injected page.
 # Listens on loopback only - never exposed outside the container.
+#
+# Upstream mode: every intercepted connection is re-established through
+# the upproxy engine (127.0.0.1:8082), which dials direct or through the
+# current task's proxy.  challenge.cloudflare.com traffic never reaches
+# here (the router sends it straight to the engine).
 
 set -u
 
 exec mitmdump \
     --listen-host 127.0.0.1 \
     --listen-port 8080 \
+    --mode upstream:http://127.0.0.1:8082 \
     --set confdir=/config/mitmproxy \
     --set connection_strategy=lazy \
     --set ssl_insecure=false \
