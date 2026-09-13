@@ -85,11 +85,11 @@ jobs:
             > solve-resp.json &
           solve_pid=$!
 
-          # Wait until the task is visible in /status (Firefox navigated).
-          for i in $(seq 1 30); do
-            if curl -s http://127.0.0.1:18081/status | grep -q '"current"'; then
-              if curl -s http://127.0.0.1:18081/status | python3 -c 'import sys,json; d=json.load(sys.stdin); exit(0 if d["current"] else 1)'; then break; fi
-            fi
+          # Wait until mitmproxy has served the injected challenge page --
+          # NOT merely until the task starts: clicking during xdotool's URL
+          # typing would focus the page body mid-navigation and break it.
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:18081/status | python3 -c 'import sys,json; d=json.load(sys.stdin); exit(0 if d["current"] and d["page_served"] else 1)'; then break; fi
             sleep 1
           done
           sleep 1  # let the widget begin rendering

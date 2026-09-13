@@ -18,9 +18,17 @@ import time
 
 from mitmproxy import http
 
+
+def _atomic_write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
 TASK_FILE = "/config/relay/task.json"
 RESULT_FILE = "/config/relay/result.json"
 CLICK_FILE = "/config/relay/last-click.json"
+PAGE_FILE = "/config/relay/page.json"
 
 # A Turnstile token is valid for 300s.  Tasks older than this are stale.
 TASK_TTL = 360
@@ -139,10 +147,7 @@ def _write_result(task, token):
         "token": token,
         "ts": int(time.time()),
     }
-    tmp = RESULT_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(result, f)
-    os.replace(tmp, RESULT_FILE)
+    _atomic_write_json(RESULT_FILE, result)
     # Single-use: drop the task so a page reload cannot deliver twice.
     try:
         os.remove(TASK_FILE)
@@ -176,6 +181,12 @@ def request(flow: http.HTTPFlow) -> None:
 
     # Document request: exact path match (query ignored), task host only.
     if host == task["hostname"] and req_path == task.get("path", "/"):
+        # Marker so the API / tests can tell the challenge page is served
+        # (navigation finished; the widget is about to render).
+        _atomic_write_json(PAGE_FILE, {
+            "task_id": task.get("task_id"),
+            "ts": int(time.time()),
+        })
         flow.response = http.Response.make(
             200,
             PAGE.format(sitekey=task["sitekey"]).encode("utf-8"),

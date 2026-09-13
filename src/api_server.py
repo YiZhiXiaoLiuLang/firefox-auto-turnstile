@@ -32,6 +32,7 @@ from urllib.parse import urlsplit
 TASK_DIR = "/config/relay"
 TASK_FILE = os.path.join(TASK_DIR, "task.json")
 RESULT_FILE = os.path.join(TASK_DIR, "result.json")
+PAGE_FILE = os.path.join(TASK_DIR, "page.json")
 COORDS_FILE = os.path.join(TASK_DIR, "coords.json")
 CLICK_FILE = os.path.join(TASK_DIR, "last-click.json")
 NAV_SCRIPT = "/opt/turnstile-relay/nav.sh"
@@ -72,7 +73,9 @@ def _slave_pointer_devices():
         return []
     names = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
-        m = re.match(r"^(.+?)\s+id=\d+\s+\[slave\s+pointer", line)
+        # Lines look like "⎜   ↳ TigerVNC pointer\tid=6\t[slave  pointer  (2)]"
+        # -- strip any tree-drawing glyphs before the device name.
+        m = re.match(r"^[⎜⎟↳│├└\s]*(.+?)\s+id=\d+\s+\[slave\s+pointer", line)
         if m:
             names.append(m.group(1).strip())
     return names
@@ -303,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         try:
             # Clear any stale result, then publish the task for mitmproxy.
-            for f in (RESULT_FILE, TASK_FILE):
+            for f in (RESULT_FILE, TASK_FILE, PAGE_FILE):
                 try:
                     os.remove(f)
                 except OSError:
@@ -378,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
                 lc = dict(_last_click) if _last_click else None
             last = _read_json(RESULT_FILE)
             self._send(200, {"ok": True, "current": cur, "last_result": last,
+                             "page_served": _read_json(PAGE_FILE),
                              "calibrated_click": lc,
                              "coords": _load_coords()})
         elif path == "/coords":
