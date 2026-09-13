@@ -10,11 +10,13 @@ solve may be in flight at a time; concurrent requests get 409.  The task is
 communicated to mitmproxy via /config/relay/task.json, and the token comes
 back via /config/relay/result.json (written by the mitmproxy addon).
 
-Click-position calibration: a persistent xinput listener records the last
-mouse click seen on the X display.  During a task, the first click's
-coordinates are captured as the Turnstile checkbox position (the user
-teaches it by clicking once), saved per-hostname in coords.json, and
-returned with the token so future runs can automate the click.
+Click-position calibration: xinput listeners watch the slave pointer
+devices for raw button presses -- the only globally visible form of a
+click on the X display -- and immediately read the pointer position via
+XQueryPointer.  During a task, the first click's coordinates are
+captured as the Turnstile checkbox position (the user teaches it by
+clicking once), saved per-hostname in coords.json, and returned with
+the token so future runs can automate the click.
 """
 
 import json
@@ -45,25 +47,72 @@ _current = None  # dict of the in-flight task, or None
 
 
 # --------------------------------------------------------------------------
-# Click listener: `xinput test-xi2 --root` streams all X input events.  A
-# normal ButtonPress carries the root (screen) coordinates; raw events
-# don't and are skipped.  Output is line-buffered by xinput itself.
+# Click listener.  Normal button events are delivered to the window under
+# the pointer (Firefox) and are invisible to xinput listeners; only RAW
+# events, broadcast through the root window, are globally observable --
+# and only from slave devices (masters emit none).  So we listen to the
+# slave pointers that can produce clicks:
+#   - "TigerVNC pointer":  a human clicking through the noVNC web UI
+#   - "Virtual core XTEST pointer": injected clicks (xdotool, tests)
+# Raw events carry no usable screen position (XTEST valuators are
+# relative), so on every RawButtonPress we query the pointer position
+# via XQueryPointer (xdotool getmouselocation), which is authoritative
+# for both human and XTEST clicks.
 # --------------------------------------------------------------------------
 
-_ev_type = None
 _click_lock = threading.Lock()
 _last_click = None  # {"x": int, "y": int, "ts": float}
 _click_during_task = None  # click captured while a task is running
 
+POINTER_DEVICES = ("TigerVNC pointer", "Virtual core XTEST pointer")
 
-def _click_monitor():
-    """Continuously track the most recent click on the X display."""
-    global _ev_type, _last_click
-    cmd = ["xinput", "test-xi2", "--root"]
+
+def _pointer_position():
+    """Current pointer position via XQueryPointer, or None."""
+    try:
+        r = subprocess.run(["xdotool", "getmouselocation", "--shell"],
+                           capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    x = y = None
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("X="):
+            x = int(line[2:])
+        elif line.startswith("Y="):
+            y = int(line[2:])
+    if x is None or y is None:
+        return None
+    return x, y
+
+
+def _record_click():
+    """Register a click event: snapshot position and update state."""
+    global _last_click, _click_during_task
+    pos = _pointer_position()
+    if pos is None:
+        return
+    click = {"x": pos[0], "y": pos[1], "ts": time.time()}
+    with _click_lock:
+        _last_click = click
+        if _current is not None:
+            _click_during_task = dict(click)
+    # Also mirror to a file so mitmproxy (separate process) can report the
+    # live click position on the injected page.
+    try:
+        _atomic_write_json(CLICK_FILE, click)
+    except OSError:
+        pass
+
+
+def _device_listener(device):
+    """Watch one slave pointer device for raw button presses."""
     while True:
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ["xinput", "test-xi2", device],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, bufsize=1,
             )
         except OSError as e:
@@ -71,36 +120,21 @@ def _click_monitor():
                   flush=True)
             time.sleep(30)
             continue
-        print("[api] click listener started: %s" % " ".join(cmd), flush=True)
         for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line.startswith("EVENT type"):
-                # Exact match: RawButtonPress is a *different* event (no
-                # root coords) and must not be confused with ButtonPress.
-                _ev_type = ("ButtonPress" in line and "Raw" not in line)
-            elif _ev_type and line.startswith("    root:"):
-                m = re.match(r"\s*root:\s*([0-9.]+)/([0-9.]+)", line)
-                if m:
-                    click = {
-                        "x": int(float(m.group(1))),
-                        "y": int(float(m.group(2))),
-                        "ts": time.time(),
-                    }
-                    with _click_lock:
-                        _last_click = click
-                        if _current is not None:
-                            _click_during_task = dict(click)
-                    # Also mirror to a file so mitmproxy (separate process) can
-                    # report the live click position on the injected page.
-                    try:
-                        _atomic_write_json(CLICK_FILE, click)
-                    except OSError:
-                        pass
+            if line.startswith("EVENT type") and "(RawButtonPress)" in line:
+                _record_click()
         rc = proc.wait()
-        err = proc.stderr.read().strip() if proc.stderr else ""
-        print("[api] xinput exited rc=%s (%s), restarting" % (rc, err[:200]),
-              flush=True)
+        print("[api] xinput listener for %r exited rc=%s, restarting"
+              % (device, rc), flush=True)
         time.sleep(2)  # respawn on unexpected exit
+
+
+def _click_monitor():
+    """Start one listener per slave pointer device."""
+    for device in POINTER_DEVICES:
+        print("[api] click listener starting for %r" % device, flush=True)
+        threading.Thread(target=_device_listener, args=(device,),
+                         daemon=True).start()
 
 
 def _get_click_during_task():

@@ -92,31 +92,15 @@ jobs:
             fi
             sleep 1
           done
-          sleep 2  # let the widget render
+          sleep 1  # let the widget begin rendering
 
-          # Simulate the user's click at a known position (inside the widget
-          # area of the injected page). xdotool clicks via the XTEST device;
-          # xinput reports it with root coordinates like a real click.
+          # Simulate the user's calibration click at a known position on the
+          # injected page.  xdotool clicks via the XTEST slave device; the
+          # api's per-device raw-event listener sees it like a real click.
           # docker exec does not inherit the services' environment; derive
           # DISPLAY from the live X socket (e.g. /tmp/.X11-unix/X0 -> :0).
           disp=$(docker exec relay-smoke sh -c 'ls /tmp/.X11-unix/ 2>/dev/null | sed -n "s/^X/:/p" | head -1')
           echo "X display for exec: $disp"
-
-          # Diagnostic matrix v2: listen to specific devices (correct names
-          # contain spaces, unlike the previous probe) - master pointer,
-          # XTEST slave, TigerVNC slave, and the xi2-all variant.
-          docker exec -e DISPLAY="$disp" relay-smoke sh -c '
-            timeout 6 xinput test-xi2 "Virtual core pointer" > /tmp/p1.txt 2>&1 &
-            timeout 6 xinput test-xi2 "Virtual core XTEST pointer" > /tmp/p2.txt 2>&1 &
-            timeout 6 xinput test-xi2 "TigerVNC pointer" > /tmp/p3.txt 2>&1 &
-            timeout 6 xinput test "Virtual core pointer" > /tmp/p4.txt 2>&1 &
-            sleep 1
-            xdotool mousemove 640 300 click 1
-            sleep 5
-            for f in /tmp/p1.txt /tmp/p2.txt /tmp/p3.txt /tmp/p4.txt; do
-              echo "=== $f:"; head -30 "$f"
-            done
-          ' || true
           docker exec -e DISPLAY="$disp" relay-smoke xdotool mousemove 640 300 click 1
 
           wait "$solve_pid"
