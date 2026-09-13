@@ -33,7 +33,7 @@ docker run -d --name turnstile-relay \
   -p 8081:8081 \
   -p 127.0.0.1:5800:5800 \
   -v $(pwd)/data:/config \
-  ghcr.io/<owner>/firefox-auto-turnstile   # 替换为你的仓库小写全名
+  ghcr.io/yizhixiaoliulang/firefox-auto-turnstile
 ```
 
 或 `docker compose up -d`。
