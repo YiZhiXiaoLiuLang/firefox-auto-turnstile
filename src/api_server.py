@@ -179,50 +179,92 @@ def _clear_click_during_task():
 
 # --------------------------------------------------------------------------
 # Auto-click: replay the calibrated checkbox position, mimicking a human
-# mouse -- curved approach in small steps, slight overshoot, tiny target
-# jitter, short press.  Repeated until the token arrives (the checkbox
-# takes ~5-7s to appear after page load), never at calibration time.
+# mouse.  Turnstile's iframe measures pointer behavior, so the click must
+# not merely hit the right pixel -- it must look like a hand:
+#   - a smooth path with many closely-spaced mousemove samples (a page
+#     that only ever sees teleports is an automation tell),
+#   - a press with a REAL duration: mousedown ... hold ... mouseup inside
+#     one xdotool script (a 0ms click is the loudest bot signature),
+#   - small overshoot/settle and per-attempt jitter.
+# Repeated until the token arrives (the checkbox takes ~5-7s to appear
+# after page load), never recorded as calibration.
 # --------------------------------------------------------------------------
 
-def _human_move_to(x, y, start):
-    """Move the pointer to (x,y) along a slightly curved, uneven path."""
+def _human_path_cmds(x, y, start, cmds):
+    """Append a curved, finely-sampled pointer path to a xdotool script."""
     # Control point off the straight line gives a shallow arc, like a
-    # hand moving around rather than a teleporting cursor.
+    # hand moving around rather than a perfectly straight machine glide.
     mx, my = (start[0] + x) / 2, (start[1] + y) / 2
     dx, dy = x - start[0], y - start[1]
     dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
     mx -= dy / dist * random.uniform(15, 60) * random.choice((-1, 1))
     my += dx / dist * random.uniform(15, 60)
-    steps = random.randint(14, 24)
+    # Enough samples that the iframe sees a moving pointer, not jumps:
+    # one mousemove every 6-14ms, like X input from real hardware.
+    steps = random.randint(50, 90)
+    prev = None
     for i in range(1, steps + 1):
         t = i / steps
-        # Quadratic bezier through the control point.
-        bx = (1 - t) ** 2 * start[0] + 2 * (1 - t) * t * mx + t * t * x
-        by = (1 - t) ** 2 * start[1] + 2 * (1 - t) * t * my + t * t * y
-        subprocess.run(["xdotool", "mousemove", str(int(round(bx))),
-                        str(int(round(by)))],
-                       capture_output=True, timeout=5)
-        time.sleep(random.uniform(0.008, 0.028))
+        # Quadratic bezier through the control point, smoothstep-eased:
+        # slow approach, faster middle, gentle landing on the target --
+        # monotonic along the curve: no backtracking, no jumps.
+        et = t * t * (3 - 2 * t)
+        px = int(round((1 - et) ** 2 * start[0]
+                       + 2 * (1 - et) * et * mx + et * et * x))
+        py = int(round((1 - et) ** 2 * start[1]
+                       + 2 * (1 - et) * et * my + et * et * y))
+        if (px, py) != prev:
+            cmds.append("mousemove %d %d" % (px, py))
+            cmds.append("sleep %.3f" % random.uniform(0.006, 0.014))
+            prev = (px, py)
 
 
 def _auto_click_once(x, y):
-    """One human-like click at (x,y); returns True if the input was sent."""
+    """One human-like click at (x,y): curved approach, real press duration.
+
+    The calibrated point is the centre of a ~50x50 checkbox, so every
+    attempt lands somewhere inside it -- humans never hit the same pixel
+    twice (recorded calibration samples show a 15-20px spread).
+    """
     global _self_click_until
+    # Sample inside the checkbox instead of the same pixel every time.
+    tx = x + random.randint(-10, 10)
+    ty = y + random.randint(-10, 10)
     pos = _pointer_position()
     start = pos if pos else (random.randint(0, 800), random.randint(0, 600))
-    # Small overshoot then settle, like a real hand.
+    cmds = []
+    # Small overshoot then settle, like a real hand; half the time go
+    # straight to keep the pattern varied.  The settle path continues
+    # from the SAME overshoot point -- a fresh random offset there would
+    # teleport the pointer between the two path segments.
     if random.random() < 0.5:
-        _human_move_to(x + random.randint(-25, 25), y + random.randint(-18, 18),
-                       start)
-        time.sleep(random.uniform(0.05, 0.15))
-        _human_move_to(x, y, _pointer_position() or (x, y))
+        ox = tx + random.randint(-25, 25)
+        oy = ty + random.randint(-18, 18)
+        _human_path_cmds(ox, oy, start, cmds)
+        cmds.append("sleep %.3f" % random.uniform(0.05, 0.15))
+        _human_path_cmds(tx, ty, (ox, oy), cmds)
     else:
-        _human_move_to(x, y, start)
-    time.sleep(random.uniform(0.1, 0.35))  # aim pause before pressing
-    _self_click_until = time.time() + 1.5  # our own XTEST press must not
-    # contaminate the calibration sample (flag read by _record_click).
-    subprocess.run(["xdotool", "click", "1"], capture_output=True, timeout=5)
-    print("[api] auto-click fired at x=%d y=%d" % (x, y), flush=True)
+        _human_path_cmds(tx, ty, start, cmds)
+    # Aim pause before pressing, like a human lining up the target.
+    cmds.append("sleep %.3f" % random.uniform(0.1, 0.35))
+    subprocess.run(["xdotool", "-"], input="\n".join(cmds),
+                   capture_output=True, text=True, timeout=15)
+    # Press with a real hold: `xdotool click` sends mousedown+mouseup
+    # back-to-back (~0ms), which reads as synthetic to the challenge
+    # iframe; a human press lasts 90-160ms with a pixel or two of drift.
+    # The suppression flag is armed just before this second script --
+    # NOT around the path script -- so the window stays short and a
+    # human rescue click at any other moment still calibrates normally.
+    _self_click_until = time.time() + 0.5
+    subprocess.run(
+        ["xdotool", "-"],
+        input=("mousedown 1\nsleep %.3f\n"
+               "mousemove %d %d\nsleep %.3f\nmouseup 1"
+               % (random.uniform(0.09, 0.16),
+                  tx + random.randint(-1, 1), ty + random.randint(-1, 1),
+                  random.uniform(0.01, 0.04))),
+        capture_output=True, text=True, timeout=5)
+    print("[api] auto-click fired at x=%d y=%d" % (tx, ty), flush=True)
 
 
 def _coord_matches_display(coord):
