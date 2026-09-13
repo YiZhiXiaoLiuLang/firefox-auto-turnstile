@@ -21,6 +21,7 @@ the token so future runs can automate the click.
 
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -33,6 +34,7 @@ TASK_DIR = "/config/relay"
 TASK_FILE = os.path.join(TASK_DIR, "task.json")
 RESULT_FILE = os.path.join(TASK_DIR, "result.json")
 PAGE_FILE = os.path.join(TASK_DIR, "page.json")
+READY_FILE = os.path.join(TASK_DIR, "widget-ready.json")
 COORDS_FILE = os.path.join(TASK_DIR, "coords.json")
 CLICK_FILE = os.path.join(TASK_DIR, "last-click.json")
 NAV_SCRIPT = "/opt/turnstile-relay/nav.sh"
@@ -42,6 +44,7 @@ DEFAULT_TIMEOUT = 180
 MAX_TIMEOUT = 300
 POLL_INTERVAL = 0.2
 NAV_MAX_WAIT = 60  # seconds to wait for a usable Firefox window
+AUTO_CLICK = os.environ.get("AUTO_CLICK", "1") not in ("0", "false", "no")
 
 _lock = threading.Lock()
 _current = None  # dict of the in-flight task, or None
@@ -63,6 +66,7 @@ _current = None  # dict of the in-flight task, or None
 _click_lock = threading.Lock()
 _last_click = None  # {"x": int, "y": int, "ts": float}
 _click_during_task = None  # click captured while a task is running
+_self_click_until = 0.0  # clicks until this time are ours: not calibration
 
 
 def _slave_pointer_devices():
@@ -108,13 +112,15 @@ def _record_click():
     if pos is None:
         return
     click = {"x": pos[0], "y": pos[1], "ts": time.time()}
+    ours = time.time() < _self_click_until
     print("[api] click recorded: x=%d y=%d%s"
           % (click["x"], click["y"],
-             " (during task)" if _current is not None else ""),
+             " (self, not calibration)" if ours else
+             (" (during task)" if _current is not None else "")),
           flush=True)
     with _click_lock:
         _last_click = click
-        if _current is not None:
+        if _current is not None and not ours:
             _click_during_task = dict(click)
     # Also mirror to a file so mitmproxy (separate process) can report the
     # live click position on the injected page.
@@ -171,6 +177,96 @@ def _clear_click_during_task():
         _click_during_task = None
 
 
+# --------------------------------------------------------------------------
+# Auto-click: replay the calibrated checkbox position, mimicking a human
+# mouse -- curved approach in small steps, slight overshoot, tiny target
+# jitter, short press.  Repeated until the token arrives (the checkbox
+# takes ~5-7s to appear after page load), never at calibration time.
+# --------------------------------------------------------------------------
+
+def _human_move_to(x, y, start):
+    """Move the pointer to (x,y) along a slightly curved, uneven path."""
+    # Control point off the straight line gives a shallow arc, like a
+    # hand moving around rather than a teleporting cursor.
+    mx, my = (start[0] + x) / 2, (start[1] + y) / 2
+    dx, dy = x - start[0], y - start[1]
+    dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+    mx -= dy / dist * random.uniform(15, 60) * random.choice((-1, 1))
+    my += dx / dist * random.uniform(15, 60)
+    steps = random.randint(14, 24)
+    for i in range(1, steps + 1):
+        t = i / steps
+        # Quadratic bezier through the control point.
+        bx = (1 - t) ** 2 * start[0] + 2 * (1 - t) * t * mx + t * t * x
+        by = (1 - t) ** 2 * start[1] + 2 * (1 - t) * t * my + t * t * y
+        subprocess.run(["xdotool", "mousemove", str(int(round(bx))),
+                        str(int(round(by)))],
+                       capture_output=True, timeout=5)
+        time.sleep(random.uniform(0.008, 0.028))
+
+
+def _auto_click_once(x, y):
+    """One human-like click at (x,y); returns True if the input was sent."""
+    global _self_click_until
+    pos = _pointer_position()
+    start = pos if pos else (random.randint(0, 800), random.randint(0, 600))
+    # Small overshoot then settle, like a real hand.
+    if random.random() < 0.5:
+        _human_move_to(x + random.randint(-25, 25), y + random.randint(-18, 18),
+                       start)
+        time.sleep(random.uniform(0.05, 0.15))
+        _human_move_to(x, y, _pointer_position() or (x, y))
+    else:
+        _human_move_to(x, y, start)
+    time.sleep(random.uniform(0.1, 0.35))  # aim pause before pressing
+    _self_click_until = time.time() + 1.5  # our own XTEST press must not
+    # contaminate the calibration sample (flag read by _record_click).
+    subprocess.run(["xdotool", "click", "1"], capture_output=True, timeout=5)
+    print("[api] auto-click fired at x=%d y=%d" % (x, y), flush=True)
+
+
+def _coord_matches_display(coord):
+    """True if the calibration was recorded at the current resolution.
+
+    Entries from before display_h was recorded only carry the width --
+    accept them on a width match; anything else must match exactly.
+    """
+    w = os.environ.get("DISPLAY_WIDTH", "")
+    h = os.environ.get("DISPLAY_HEIGHT", "")
+    if not (w and h):
+        return True  # resolution unknown: trust the calibration
+    dw = str(coord.get("display_w", coord.get("display", "")))
+    dh = str(coord.get("display_h", ""))
+    if not dw:
+        return True  # pre-resolution-era entry: trust it
+    if not dh:
+        return dw == w  # width-only legacy entry
+    return dw == w and dh == h
+
+
+def _auto_click_loop(task, coord, deadline, is_done):
+    """Re-click the calibrated position until the token arrives.
+
+    The checkbox only appears ~5-7s after page load and may need a moment
+    more to become clickable, so keep firing (with pauses) rather than
+    betting on one shot.
+    """
+    x, y = coord["x"], coord["y"]
+    print("[api] auto-click enabled for %s at (%d,%d)"
+          % (task["hostname"], x, y), flush=True)
+    next_click = time.time() + 1.0  # first attempt ~1s after loop start
+    while time.time() < deadline and not is_done():
+        if time.time() >= next_click:
+            try:
+                _auto_click_once(x + random.randint(-2, 2),
+                                 y + random.randint(-2, 2))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print("[api] auto-click failed: %s" % e, flush=True)
+            # Widget load takes 5-7s; retry soon, back off slowly.
+            next_click = time.time() + random.uniform(1.5, 2.5)
+        time.sleep(0.2)
+
+
 def _load_coords():
     return _read_json(COORDS_FILE) or {}
 
@@ -181,7 +277,10 @@ def _save_coord(hostname, click, sitekey):
     coords[hostname] = {
         "x": click["x"], "y": click["y"],
         "sitekey": sitekey,
-        "display": os.environ.get("DISPLAY_WIDTH", ""),  # resolution context
+        # Resolution context: a coordinate is only valid at the
+        # resolution it was recorded at.
+        "display_w": os.environ.get("DISPLAY_WIDTH", ""),
+        "display_h": os.environ.get("DISPLAY_HEIGHT", ""),
         "ts": int(time.time()),
     }
     _atomic_write_json(COORDS_FILE, coords)
@@ -303,10 +402,18 @@ class Handler(BaseHTTPRequestHandler):
         _current = task
         _clear_click_during_task()
         coord = _load_coords().get(task["hostname"])
+        auto = (AUTO_CLICK and coord
+                and isinstance(coord.get("x"), int)
+                and isinstance(coord.get("y"), int)
+                and _coord_matches_display(coord))
+        if coord and not auto and AUTO_CLICK:
+            print("[api] calibration for %s unusable (resolution changed?) "
+                  "-- falling back to manual click" % task["hostname"],
+                  flush=True)
         started = time.time()
         try:
             # Clear any stale result, then publish the task for mitmproxy.
-            for f in (RESULT_FILE, TASK_FILE, PAGE_FILE):
+            for f in (RESULT_FILE, TASK_FILE, PAGE_FILE, READY_FILE):
                 try:
                     os.remove(f)
                 except OSError:
@@ -323,6 +430,8 @@ class Handler(BaseHTTPRequestHandler):
 
             deadline = time.time() + task["timeout"]
             click = None
+            clicked_at = None
+            auto_thread = None
             while time.time() < deadline:
                 result = _read_json(RESULT_FILE)
                 if result and result.get("task_id") == task["task_id"]:
@@ -332,11 +441,31 @@ class Handler(BaseHTTPRequestHandler):
                     click = _get_click_during_task()
                     if click:
                         _save_coord(task["hostname"], click, task["sitekey"])
+                    if auto_thread is not None:
+                        print("[api] token arrived after auto-click pass"
+                              if clicked_at else "[api] token arrived",
+                              flush=True)
                     return 200, {"ok": True, "task_id": task["task_id"],
                                  "hostname": task["hostname"],
                                  "token": result["token"], "elapsed": elapsed,
                                  "click": click,
-                                 "calibrated": bool(click)}
+                                 "calibrated": bool(click),
+                                 "auto_clicked": auto_thread is not None}
+                # Once the challenge document is served and the widget is
+                # ready to receive input, start replaying the calibrated
+                # position (checkbox itself still takes ~5-7s to show).
+                if (auto and auto_thread is None
+                        and _read_json(READY_FILE)):
+                    auto_thread = threading.Thread(
+                        target=_auto_click_loop,
+                        args=(task, coord, deadline,
+                              lambda: (_read_json(RESULT_FILE) or {}).get(
+                                  "task_id") == task["task_id"]),
+                        daemon=True)
+                    auto_thread.start()
+                    clicked_at = time.time()
+                # Manual clicks still work while auto-click runs: the
+                # listener keeps updating the calibration sample.
                 time.sleep(POLL_INTERVAL)
             return 504, {"ok": False, "task_id": task["task_id"],
                          "error": "timed out waiting for token"}

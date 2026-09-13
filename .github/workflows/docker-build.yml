@@ -94,7 +94,7 @@ jobs:
           done
           sleep 1  # let the widget begin rendering
 
-          # Simulate the user's calibration click at a known position on the
+          # Simulate the user's CALIBRATION click at a known position on the
           # injected page.  xdotool clicks via the XTEST slave device; the
           # api's per-device raw-event listener sees it like a real click.
           # docker exec does not inherit the services' environment; derive
@@ -106,9 +106,20 @@ jobs:
           wait "$solve_pid"
           resp=$(cat solve-resp.json)
           echo "solve response: $resp"
-          echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is True and d["token"]=="XXXX.DUMMY.TOKEN.XXXX" and d["hostname"]=="example.com" and d.get("calibrated") is True and d["click"]["x"]==640 and d["click"]["y"]==300, d; print("smoke test passed: token + calibration click", d["click"], "in", d["elapsed"], "s")'
+          echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is True and d["token"]=="XXXX.DUMMY.TOKEN.XXXX" and d["hostname"]=="example.com" and d.get("calibrated") is True and d["click"]["x"]==640 and d["click"]["y"]==300, d; print("task 1 passed: token + calibration click", d["click"], "in", d["elapsed"], "s")'
           # The calibration must also be persisted per-hostname.
           curl -s http://127.0.0.1:18081/coords | python3 -c 'import sys,json; d=json.load(sys.stdin); c=d["coords"]["example.com"]; assert c["x"]==640 and c["y"]==300, d; print("coords persisted:", c)'
+
+          # ---- Task 2: AUTO-CLICK.  No manual click at all this time; the
+          # API must replay the calibrated position itself (the page reports
+          # widget-ready via /.widget-ready/, the auto-clicker then clicks
+          # until the token arrives) and its own clicks must NOT poison the
+          # calibration sample.
+          resp2=$(curl -s -X POST http://127.0.0.1:18081/solve \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com/login","sitekey":"1x00000000000000000000BB","timeout":120}')
+          echo "solve response 2: $resp2"
+          echo "$resp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is True and d["token"]=="XXXX.DUMMY.TOKEN.XXXX" and d.get("auto_clicked") is True, d; print("task 2 passed: auto-clicked, no human, in", d["elapsed"], "s")'
 
       - name: Build and push by digest
         if: github.event_name != 'pull_request'

@@ -29,6 +29,7 @@ TASK_FILE = "/config/relay/task.json"
 RESULT_FILE = "/config/relay/result.json"
 CLICK_FILE = "/config/relay/last-click.json"
 PAGE_FILE = "/config/relay/page.json"
+READY_FILE = "/config/relay/widget-ready.json"
 
 # A Turnstile token is valid for 300s.  Tasks older than this are stale.
 TASK_TTL = 360
@@ -70,6 +71,10 @@ PAGE = """<!DOCTYPE html>
     setTimeout(function () {{ clearInterval(t); reject('timeout'); }}, 20000);
   }});
   turnstileReady.then(function (ts) {{
+    // Tell the API the widget container is being populated: the Turnstile
+    // iframe that hosts the checkbox will appear inside #c shortly, and
+    // the auto-click replay waits for exactly this signal.
+    try {{ fetch('/.widget-ready/'); }} catch (e) {{}}
     ts.render('#c', {{
       sitekey: '{sitekey}',
       callback: function (token) {{
@@ -163,6 +168,17 @@ def request(flow: http.HTTPFlow) -> None:
     host = flow.request.host
     req_path = flow.request.path.split("?", 1)[0]
 
+    # Widget-ready signal: the injected page reports that Turnstile's API
+    # loaded and the iframe is about to render -- the auto-click replay
+    # starts from this point (the checkbox itself still takes ~5-7s).
+    if host == task["hostname"] and req_path == "/.widget-ready/":
+        _atomic_write_json(READY_FILE, {
+            "task_id": task.get("task_id"),
+            "ts": int(time.time()),
+        })
+        flow.response = http.Response.make(204, b"", {})
+        return
+
     # Token delivery endpoint (same-origin fetch from the injected page).
     if host == task["hostname"] and req_path == "/.relay-token/":
         token = flow.request.query.get("t")
@@ -190,5 +206,11 @@ def request(flow: http.HTTPFlow) -> None:
         flow.response = http.Response.make(
             200,
             PAGE.format(sitekey=task["sitekey"]).encode("utf-8"),
-            {"Content-Type": "text/html; charset=utf-8"},
+            {
+                "Content-Type": "text/html; charset=utf-8",
+                # The challenge page must never be served from cache: each
+                # task needs a fresh page so it reports ready + token to
+                # *this* task's context files.
+                "Cache-Control": "no-store",
+            },
         )
