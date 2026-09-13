@@ -255,7 +255,7 @@ def _pump(a, b):
 
 
 def _parse_target(buf):
-    """(host, port, raw CONNECT line) from a request buffer, or None."""
+    """(host, port) from a CONNECT request head, or None."""
     m = CONNECT_RE.match(buf)
     if not m:
         return None
@@ -263,34 +263,41 @@ def _parse_target(buf):
     if ":" in target:
         host, port = target.rsplit(":", 1)
         try:
-            return host, int(port), m.group(0)
+            return host, int(port)
         except ValueError:
-            return target, 443, m.group(0)
-    return target, 443, m.group(0)
+            return target, 443
+    return target, 443
 
 
-def _read_request_line(request, want_headers=False):
-    """Buffer the client's request head.
+def _split_head(buf):
+    """(head, bytes after the head) -- clients may pipeline tunnel bytes."""
+    i = buf.find(b"\r\n\r\n")
+    if i < 0:
+        return buf, b""
+    return buf[:i + 4], buf[i + 4:]
 
-    CONNECT never carries a body, and clients (Firefox, mitmproxy) send
-    the request line alone and WAIT for the 200 before anything else --
-    so by default we return as soon as the first line is complete.  Only
-    require the full blank-line-terminated head when want_headers (for
-    non-CONNECT requests we would need to see all headers; we don't
-    serve those).
+
+def _read_request_head(request):
+    """Buffer the client's complete request head (up to the blank line).
+
+    CONNECT carries no body: the head is the request line plus headers,
+    terminated by an empty line -- and both Firefox and mitmproxy (upstream
+    mode) send the whole head before waiting for the 200.  Consuming it
+    fully matters twice: the router forwards the head verbatim (a bare
+    request line is an incomplete request that a real HTTP proxy such as
+    mitmproxy waits on forever), and the engine must swallow the headers
+    so the tunnel payload starts with clean TLS bytes rather than the
+    tail of the head.
     """
     buf = b""
-    while True:
-        if not want_headers and b"\r\n" in buf:
-            return buf
-        if want_headers and b"\r\n\r\n" in buf:
-            return buf
+    while b"\r\n\r\n" not in buf:
         chunk = request.recv(8192)
         if not chunk:
             return buf if buf else None
         buf += chunk
         if len(buf) > 16384:
             return None
+    return buf
 
 
 def _serve_tunnel(request, upstream_sock):
@@ -309,14 +316,14 @@ def _serve_tunnel(request, upstream_sock):
 
 class _EngineHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        buf = _read_request_line(self.request)
+        buf = _read_request_head(self.request)
         if buf is None:
             return
         parsed = _parse_target(buf)
         if not parsed:
             self.request.sendall(b"HTTP/1.1 405 CONNECT only\r\n\r\n")
             return
-        host, port, _ = parsed
+        host, port = parsed
         try:
             up = dial(host, port)
         except OSError as e:
@@ -325,6 +332,9 @@ class _EngineHandler(socketserver.BaseRequestHandler):
                  % str(e).encode("latin-1", "replace")[:200]))
             return
         self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        _, extra = _split_head(buf)
+        if extra:
+            up.sendall(extra)  # pipelined tunnel bytes arrived with the head
         _serve_tunnel(self.request, up)
 
 
@@ -349,7 +359,7 @@ def _route(host, port):
 
 class _RouterHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        buf = _read_request_line(self.request)
+        buf = _read_request_head(self.request)
         if buf is None:
             return
         parsed = _parse_target(buf)
@@ -358,14 +368,17 @@ class _RouterHandler(socketserver.BaseRequestHandler):
             # a manual proxy with all-protocols, and our pages are https.
             self.request.sendall(b"HTTP/1.1 405 CONNECT only\r\n\r\n")
             return
-        host, port, connect_line = parsed
+        host, port = parsed
         dst_host, dst_port = _route(host, port)
         try:
             up = socket.create_connection((dst_host, dst_port), timeout=10)
         except OSError:
             self.request.sendall(b"HTTP/1.1 502 upstream down\r\n\r\n")
             return
-        up.sendall(connect_line)  # forward the original CONNECT verbatim
+        # Forward the COMPLETE head verbatim: a bare request line is an
+        # unterminated request that a real HTTP server (mitmproxy) waits
+        # on forever -- this is what deadlocked the chain before.
+        up.sendall(buf)
         up.settimeout(20)
         # The upstream (engine or mitmproxy) answers the handshake; relay
         # its status line and any piggybacked bytes, then switch to pumping.
