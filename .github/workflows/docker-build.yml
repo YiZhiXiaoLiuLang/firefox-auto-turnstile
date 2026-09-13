@@ -101,6 +101,11 @@ jobs:
           # DISPLAY from the live X socket (e.g. /tmp/.X11-unix/X0 -> :0).
           disp=$(docker exec relay-smoke sh -c 'ls /tmp/.X11-unix/ 2>/dev/null | sed -n "s/^X/:/p" | head -1')
           echo "X display for exec: $disp"
+
+          # Diagnostic: prove the xinput listener sees XTEST clicks (same
+          # path the API service relies on). 5s window, click in the middle.
+          docker exec -e DISPLAY="$disp" relay-smoke sh -c \
+            'timeout 5 xinput test-xi2 --root > /tmp/xinput-probe.txt 2>&1 & sleep 1; xdotool mousemove 640 300 click 1; sleep 4; grep -A6 "ButtonPress" /tmp/xinput-probe.txt | head -20' || true
           docker exec -e DISPLAY="$disp" relay-smoke xdotool mousemove 640 300 click 1
 
           wait "$solve_pid"

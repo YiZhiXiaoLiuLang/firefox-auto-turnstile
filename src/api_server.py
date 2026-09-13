@@ -63,12 +63,15 @@ def _click_monitor():
     while True:
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
             )
-        except OSError:
-            time.sleep(5)
+        except OSError as e:
+            print("[api] xinput not available (%s), click calibration disabled" % e,
+                  flush=True)
+            time.sleep(30)
             continue
+        print("[api] click listener started: %s" % " ".join(cmd), flush=True)
         for line in proc.stdout:
             line = line.rstrip("\n")
             if line.startswith("EVENT type"):
@@ -93,7 +96,10 @@ def _click_monitor():
                         _atomic_write_json(CLICK_FILE, click)
                     except OSError:
                         pass
-        proc.wait()
+        rc = proc.wait()
+        err = proc.stderr.read().strip() if proc.stderr else ""
+        print("[api] xinput exited rc=%s (%s), restarting" % (rc, err[:200]),
+              flush=True)
         time.sleep(2)  # respawn on unexpected exit
 
 
